@@ -22,6 +22,11 @@ dist/
 .idea/
 .DS_Store
 
+# Contexto de agentes de IA (nunca se sube al repo público)
+AGENTS.md
+CLAUDE.md
+.claude/
+
 # Variables de entorno y secretos
 .env
 .env.*
