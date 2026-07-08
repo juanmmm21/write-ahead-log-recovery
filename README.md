@@ -182,12 +182,6 @@ Not applicable at this stage: this subproject's goal is the correctness of the d
 - **`WalIOError` on `append_*` or `truncate_before`:** a real I/O failure (disk full, permissions). The message includes the path and the original `OSError`.
 - **The WAL doesn't grow after several `checkpoint` calls:** `checkpoint()` alone doesn't truncate anything — it only computes `safe_truncation_lsn`. `truncate_before(info.safe_truncation_lsn)` must be called explicitly (or use `--truncate` on the CLI).
 
-## Roadmap
-
-- [ ] Publish a real `StorageApplier` adapter in `nanosql` over `bplus-tree-storage-engine` and `lsm-tree-engine`.
-- [ ] Automatic checkpointing based on a log-size threshold, instead of only on demand.
-- [ ] Log size / truncation rate metrics exposed by the CLI.
-
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
