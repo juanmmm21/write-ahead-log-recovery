@@ -31,6 +31,11 @@ class RecordType(IntEnum):
     ABORT = 5
     CHECKPOINT_BEGIN = 6
     CHECKPOINT_END = 7
+    # Transacción deshecha cuyos registros de compensación (CLR, la inversa
+    # de cada operación en orden inverso) la preceden en el log: la
+    # deshacción es parte de la historia y la recuperación no la repite.
+    # `ABORT` (logs antiguos) sigue significando "deshacer en recuperación".
+    ROLLBACK = 8
 
 
 @dataclass(frozen=True, slots=True)

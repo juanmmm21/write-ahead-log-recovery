@@ -15,7 +15,6 @@ checksum), lo que permite detectar corrupción de cualquier campo.
 from __future__ import annotations
 
 import io
-import os
 import struct
 import threading
 import zlib
@@ -23,6 +22,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import BinaryIO
 
+from write_ahead_log_recovery.faultfs import FileHandle, FileSystem, OsFileSystem
 from write_ahead_log_recovery.models import (
     MAGIC,
     CheckpointInfo,
@@ -201,13 +201,49 @@ def iter_records(reader: BinaryIO) -> Iterator[LogRecord]:
         yield record
 
 
-def iter_records_from_path(path: Path) -> Iterator[LogRecord]:
-    """Como `iter_records` pero abriendo el fichero en modo lectura."""
-    with open(path, "rb") as reader:
-        yield from iter_records(reader)
+def iter_records_from_path(path: Path, fs: FileSystem | None = None) -> Iterator[LogRecord]:
+    """Como `iter_records` pero leyendo el fichero (a través de `fs`)."""
+    yield from iter_records(io.BytesIO((fs or OsFileSystem()).read_bytes(path)))
 
 
 # --- Escritor del WAL --------------------------------------------------------
+
+_OPERATION_TYPES = frozenset({RecordType.INSERT, RecordType.UPDATE, RecordType.DELETE})
+_TERMINAL_TYPES = frozenset({RecordType.COMMIT, RecordType.ABORT, RecordType.ROLLBACK})
+
+
+def _compensation(record: LogRecord) -> LogRecord:
+    """Registro de compensación (CLR) de una operación: su inversa exacta,
+    con los valores antes/después intercambiados."""
+    if record.record_type == RecordType.INSERT:
+        assert record.new_value is not None
+        return LogRecord(
+            lsn=1,
+            record_type=RecordType.DELETE,
+            transaction_id=record.transaction_id,
+            table=record.table,
+            key=record.key,
+            old_value=record.new_value,
+        )
+    if record.record_type == RecordType.UPDATE:
+        return LogRecord(
+            lsn=1,
+            record_type=RecordType.UPDATE,
+            transaction_id=record.transaction_id,
+            table=record.table,
+            key=record.key,
+            new_value=record.old_value,
+            old_value=record.new_value,
+        )
+    assert record.old_value is not None
+    return LogRecord(
+        lsn=1,
+        record_type=RecordType.INSERT,
+        transaction_id=record.transaction_id,
+        table=record.table,
+        key=record.key,
+        new_value=record.old_value,
+    )
 
 
 class WriteAheadLog:
@@ -223,47 +259,99 @@ class WriteAheadLog:
     a disco es siempre secuencial).
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, fs: FileSystem | None = None) -> None:
         self._path = path
+        self._fs: FileSystem = fs or OsFileSystem()
         self._lock = threading.Lock()
         self._next_lsn = 1
         self._next_txn_id = 1
         self._txn_first_lsn: dict[int, int] = {}
+        # Operaciones de cada transacción activa: `abort` las necesita para
+        # escribir sus registros de compensación.
+        self._txn_ops: dict[int, list[LogRecord]] = {}
 
-        if path.exists() and path.stat().st_size > 0:
+        if self._fs.exists(path) and self._fs.read_bytes(path):
             self._bootstrap_from_existing()
 
+        created = not self._fs.exists(path)
         try:
-            self._file: BinaryIO = open(path, "a+b")
+            self._file: FileHandle = self._fs.open_append(path)
+            self._discard_invalid_tail()
+            if created:
+                # La entrada de directorio de un fichero recién creado no es
+                # durable hasta hacer fsync del directorio: sin esto, un crash
+                # podía hacer desaparecer el WAL entero con commits ya
+                # confirmados dentro (encontrado por test_crash_consistency).
+                self._fs.fsync_dir(path.parent)
         except OSError as exc:
             raise WalIOError(f"no se pudo abrir el WAL en {path}: {exc}") from exc
 
     def _bootstrap_from_existing(self) -> None:
-        """Recorre un log ya existente para recalcular el siguiente LSN y
-        el siguiente id de transacción disponibles, tolerando una cola
-        truncada (crash previo) pero no corrupción real a mitad de fichero."""
+        """Recorre el log existente para recalcular el siguiente LSN y el
+        siguiente id de transacción, y localiza dónde termina su prefijo
+        válido (`self._valid_end`).
+
+        Todo lo que haya después del primer registro ilegible — una cola a
+        medio escribir por un crash (truncada o con CRC inválido) o
+        corrupción — es invisible para `recover`, que se detiene ahí. Por
+        eso, al abrir, el fichero se recorta a ese punto: si se siguiera
+        añadiendo detrás de la basura, los registros nuevos (commits ya
+        confirmados al llamador) quedarían también fuera del alcance de la
+        recuperación. Antes de recortar, la cola descartada se guarda en
+        `<wal>.tail-<offset>` para poder inspeccionarla.
+        """
         max_lsn = 0
         max_txn_id = 0
         try:
-            with open(self._path, "rb") as reader:
-                try:
-                    for record in iter_records(reader):
-                        max_lsn = max(max_lsn, record.lsn)
-                        max_txn_id = max(max_txn_id, record.transaction_id)
-                        if record.transaction_id not in self._txn_first_lsn and (
-                            record.record_type
-                            in (RecordType.INSERT, RecordType.UPDATE, RecordType.DELETE)
-                        ):
-                            self._txn_first_lsn[record.transaction_id] = record.lsn
-                except TruncatedRecordError:
-                    # Cola cortada por una caída anterior: se ignora, el resto
-                    # del log leído hasta aquí sigue siendo válido.
-                    pass
+            data = self._fs.read_bytes(self._path)
         except OSError as exc:
             raise WalIOError(f"no se pudo leer el WAL existente en {self._path}: {exc}") from exc
-
+        reader = io.BytesIO(data)
+        valid_end = 0
+        ops: dict[int, list[LogRecord]] = {}
+        finished: set[int] = set()
+        try:
+            while True:
+                record = decode_one_record(reader)
+                if record is None:
+                    break
+                valid_end = reader.tell()
+                max_lsn = max(max_lsn, record.lsn)
+                max_txn_id = max(max_txn_id, record.transaction_id)
+                if record.record_type in _OPERATION_TYPES:
+                    ops.setdefault(record.transaction_id, []).append(record)
+                elif record.record_type in _TERMINAL_TYPES:
+                    finished.add(record.transaction_id)
+        except (TruncatedRecordError, ChecksumMismatchError, InvalidRecordError):
+            pass
+        # Las operaciones de transacciones sin registro final se conservan:
+        # una transacción puede seguir viva entre aperturas del log (la CLI
+        # de demostración lo hace). Declararlas perdedoras y registrar su
+        # deshacción es trabajo de `recover`.
+        for txn, recs in ops.items():
+            if txn not in finished:
+                self._txn_ops[txn] = recs
+                self._txn_first_lsn[txn] = recs[0].lsn
+        self._valid_end = valid_end
+        self._invalid_tail = data[valid_end:]
         self._next_lsn = max_lsn + 1
         self._next_txn_id = max_txn_id + 1
+
+    def _discard_invalid_tail(self) -> None:
+        tail = getattr(self, "_invalid_tail", b"")
+        if not tail:
+            return
+        side = self._path.with_suffix(self._path.suffix + f".tail-{self._valid_end}")
+        writer = self._fs.open_write(side)
+        try:
+            writer.write(tail)
+            writer.sync()
+        finally:
+            writer.close()
+        self._fs.fsync_dir(self._path.parent)
+        self._file.truncate(self._valid_end)
+        self._file.sync()
+        self._invalid_tail = b""
 
     def close(self) -> None:
         self._file.close()
@@ -283,37 +371,58 @@ class WriteAheadLog:
             self._next_txn_id += 1
             return txn_id
 
+    def _write_rollback(self, txn: int, ops: Sequence[LogRecord]) -> int:
+        """CLRs (inversa de cada operación, de la última a la primera) y el
+        registro ROLLBACK que cierra la transacción. Llamar con el lock."""
+        for record in reversed(ops):
+            self._append_locked(_compensation(record))
+        self._txn_ops.pop(txn, None)
+        self._txn_first_lsn.pop(txn, None)
+        return self._append_locked(
+            LogRecord(lsn=1, record_type=RecordType.ROLLBACK, transaction_id=txn)
+        )
+
     def _append_record(self, partial: LogRecord) -> int:
         with self._lock:
-            lsn = self._next_lsn
-            record = LogRecord(
-                lsn=lsn,
-                record_type=partial.record_type,
-                transaction_id=partial.transaction_id,
-                table=partial.table,
-                key=partial.key,
-                new_value=partial.new_value,
-                old_value=partial.old_value,
-                active_transaction_ids=partial.active_transaction_ids,
-            )
-            encoded = encode_record(record)
-            try:
-                self._file.write(encoded)
-                self._file.flush()
-                os.fsync(self._file.fileno())
-            except OSError as exc:
-                raise WalIOError(
-                    f"fallo de E/S escribiendo el registro LSN={lsn} en {self._path}: {exc}"
-                ) from exc
+            return self._append_locked(partial)
 
-            self._next_lsn += 1
-            if record.record_type in (
-                RecordType.INSERT,
-                RecordType.UPDATE,
-                RecordType.DELETE,
-            ):
-                self._txn_first_lsn.setdefault(record.transaction_id, lsn)
-            return lsn
+    def _append_locked(self, partial: LogRecord) -> int:
+        lsn = self._next_lsn
+        record = LogRecord(
+            lsn=lsn,
+            record_type=partial.record_type,
+            transaction_id=partial.transaction_id,
+            table=partial.table,
+            key=partial.key,
+            new_value=partial.new_value,
+            old_value=partial.old_value,
+            active_transaction_ids=partial.active_transaction_ids,
+        )
+        encoded = encode_record(record)
+        size_before = self._file.size()
+        try:
+            self._file.write(encoded)
+            self._file.sync()
+        except OSError as exc:
+            # Un registro a medias al final del fichero haría inalcanzable
+            # todo lo que se añadiera después: se intenta volver al tamaño
+            # previo antes de propagar el error.
+            try:
+                self._file.truncate(size_before)
+                self._file.sync()
+            except OSError:
+                pass
+            raise WalIOError(
+                f"fallo de E/S escribiendo el registro LSN={lsn} en {self._path}: {exc}"
+            ) from exc
+
+        self._next_lsn += 1
+        if record.record_type in _OPERATION_TYPES:
+            self._txn_first_lsn.setdefault(record.transaction_id, lsn)
+            self._txn_ops.setdefault(record.transaction_id, []).append(record)
+        elif record.record_type in _TERMINAL_TYPES:
+            self._txn_ops.pop(record.transaction_id, None)
+        return lsn
 
     def append_insert(self, transaction_id: int, table: str, key: bytes, value: bytes) -> int:
         placeholder = LogRecord(
@@ -363,8 +472,15 @@ class WriteAheadLog:
         return self._append_record(placeholder)
 
     def abort(self, transaction_id: int) -> int:
-        placeholder = LogRecord(lsn=1, record_type=RecordType.ABORT, transaction_id=transaction_id)
-        return self._append_record(placeholder)
+        """Deshace la transacción en el log: un registro de compensación por
+        operación (en orden inverso) y un ROLLBACK final. El llamador deshace
+        su efecto en el storage como siempre; la recuperación ya no lo
+        repite, porque la deshacción forma parte de la historia — sin esto,
+        una recuperación posterior deshacía la transacción abortada encima
+        de commits más recientes sobre las mismas claves."""
+        with self._lock:
+            ops = list(self._txn_ops.get(transaction_id, ()))
+            return self._write_rollback(transaction_id, ops)
 
     def checkpoint(self, active_transaction_ids: Sequence[int]) -> CheckpointInfo:
         """Escribe un par CHECKPOINT_BEGIN/CHECKPOINT_END y calcula el LSN
@@ -402,38 +518,45 @@ class WriteAheadLog:
         fichero a medias.
         """
         with self._lock:
-            self._file.flush()
-            os.fsync(self._file.fileno())
+            fs = self._fs
+            self._file.sync()
 
             tmp_path = self._path.with_suffix(self._path.suffix + ".compact.tmp")
             kept = 0
             discarded = 0
             try:
-                with open(self._path, "rb") as reader, open(tmp_path, "wb") as writer:
-                    for record in iter_records(reader):
-                        if record.lsn >= safe_lsn:
-                            writer.write(encode_record(record))
-                            kept += 1
-                        else:
-                            discarded += 1
-                    writer.flush()
-                    os.fsync(writer.fileno())
-                os.replace(tmp_path, self._path)
+                writer = fs.open_write(tmp_path)
+                try:
+                    with io.BytesIO(fs.read_bytes(self._path)) as reader:
+                        for record in iter_records(reader):
+                            if record.lsn >= safe_lsn:
+                                writer.write(encode_record(record))
+                                kept += 1
+                            else:
+                                discarded += 1
+                    writer.sync()
+                finally:
+                    writer.close()
+                fs.replace(tmp_path, self._path)
+                # El rename tampoco es durable sin fsync del directorio: si se
+                # perdiera, el nombre seguiría apuntando al log antiguo y los
+                # registros añadidos después (al fichero nuevo) se perderían.
+                fs.fsync_dir(self._path.parent)
             except OSError as exc:
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
+                if fs.exists(tmp_path):
+                    fs.unlink(tmp_path)
                 raise WalIOError(f"fallo truncando el WAL en {self._path}: {exc}") from exc
             except TruncatedRecordError:
                 # El log activo (no cerrado) puede terminar en un registro a
                 # medio escribir si se llama justo tras un fallo previo sin
                 # recuperar; no se trunca en ese caso para no perder datos.
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
+                if fs.exists(tmp_path):
+                    fs.unlink(tmp_path)
                 raise
 
             self._file.close()
             try:
-                self._file = open(self._path, "a+b")
+                self._file = fs.open_append(self._path)
             except OSError as exc:
                 raise WalIOError(
                     f"no se pudo reabrir el WAL tras truncar en {self._path}: {exc}"
@@ -445,7 +568,13 @@ class WriteAheadLog:
 # --- Recuperación redo/undo --------------------------------------------------
 
 
-def recover(path: Path, applier: StorageApplier) -> RecoveryReport:
+def recover(
+    path: Path,
+    applier: StorageApplier,
+    *,
+    fs: FileSystem | None = None,
+    repair: bool = True,
+) -> RecoveryReport:
     """Recupera el estado de `applier` reproduciendo el WAL en `path`.
 
     Algoritmo (ARIES: análisis + redo + undo, sin páginas físicas):
@@ -475,18 +604,27 @@ def recover(path: Path, applier: StorageApplier) -> RecoveryReport:
     en los flags del `RecoveryReport`.
     """
     committed: set[int] = set()
+    compensated: set[int] = set()
     operations_in_lsn_order: list[LogRecord] = []
     txn_ids_with_ops: set[int] = set()
     records_scanned = 0
     stopped_due_to_truncation = False
     stopped_due_to_corruption = False
 
+    filesystem = fs or OsFileSystem()
+    data = filesystem.read_bytes(path)
+    valid_end = 0
+    max_lsn = 0
     try:
-        with open(path, "rb") as reader:
+        with io.BytesIO(data) as reader:
             for record in iter_records(reader):
+                valid_end = reader.tell()
+                max_lsn = max(max_lsn, record.lsn)
                 records_scanned += 1
                 if record.record_type == RecordType.COMMIT:
                     committed.add(record.transaction_id)
+                elif record.record_type == RecordType.ROLLBACK:
+                    compensated.add(record.transaction_id)
                 elif record.record_type in (
                     RecordType.INSERT,
                     RecordType.UPDATE,
@@ -512,13 +650,25 @@ def recover(path: Path, applier: StorageApplier) -> RecoveryReport:
         redone += 1
 
     # Undo: se deshacen, en orden inverso de LSN, solo los efectos de las
-    # transacciones que nunca llegaron a confirmarse.
-    rolled_back = txn_ids_with_ops - committed
+    # transacciones sin registro final. Las cerradas con ROLLBACK ya
+    # llevan su deshacción en la historia (CLRs reaplicados en el redo).
+    losers = txn_ids_with_ops - committed - compensated
     undone = 0
     for record in reversed(operations_in_lsn_order):
-        if record.transaction_id in rolled_back:
+        if record.transaction_id in losers:
             _apply_undo(applier, record)
             undone += 1
+    rolled_back = losers | (compensated - committed)
+
+    if repair:
+        _repair_log(
+            path,
+            filesystem,
+            data,
+            valid_end,
+            [r for r in operations_in_lsn_order if r.transaction_id in losers],
+            max_lsn + 1,
+        )
 
     return RecoveryReport(
         records_scanned=records_scanned,
@@ -528,6 +678,71 @@ def recover(path: Path, applier: StorageApplier) -> RecoveryReport:
         rolled_back_transactions=frozenset(rolled_back),
         stopped_due_to_truncation=stopped_due_to_truncation,
         stopped_due_to_corruption=stopped_due_to_corruption,
+    )
+
+
+def _repair_log(
+    path: Path,
+    fs: FileSystem,
+    data: bytes,
+    valid_end: int,
+    loser_ops: list[LogRecord],
+    next_lsn: int,
+) -> None:
+    """Deja el log coherente con lo que la recuperación acaba de hacer:
+
+    1. La cola ilegible (registro a medias de un crash, o corrupción) se
+       guarda en `<wal>.tail-<offset>` y se recorta: lo que se añada
+       después debe quedar al alcance de futuras recuperaciones.
+    2. Cada transacción perdedora (sin COMMIT/ROLLBACK) recibe sus CLRs y un
+       ROLLBACK, igual que un `abort()`: el undo que se acaba de aplicar al
+       storage pasa a formar parte de la historia y ninguna recuperación
+       futura lo repetirá encima de commits posteriores.
+
+    Ambos pasos son idempotentes: un crash a mitad de la reparación deja un
+    log que la siguiente recuperación repara igual.
+    """
+    tail = data[valid_end:]
+    if not tail and not loser_ops:
+        return
+    handle = fs.open_append(path)
+    try:
+        if tail:
+            side = path.with_suffix(path.suffix + f".tail-{valid_end}")
+            writer = fs.open_write(side)
+            try:
+                writer.write(tail)
+                writer.sync()
+            finally:
+                writer.close()
+            fs.fsync_dir(path.parent)
+            handle.truncate(valid_end)
+            handle.sync()
+        by_txn: dict[int, list[LogRecord]] = {}
+        for record in loser_ops:
+            by_txn.setdefault(record.transaction_id, []).append(record)
+        lsn = next_lsn
+        for txn in sorted(by_txn):
+            records = [_compensation(r) for r in reversed(by_txn[txn])]
+            records.append(LogRecord(lsn=1, record_type=RecordType.ROLLBACK, transaction_id=txn))
+            for partial in records:
+                handle.write(encode_record(_with_lsn(partial, lsn)))
+                lsn += 1
+            handle.sync()
+    finally:
+        handle.close()
+
+
+def _with_lsn(record: LogRecord, lsn: int) -> LogRecord:
+    return LogRecord(
+        lsn=lsn,
+        record_type=record.record_type,
+        transaction_id=record.transaction_id,
+        table=record.table,
+        key=record.key,
+        new_value=record.new_value,
+        old_value=record.old_value,
+        active_transaction_ids=record.active_transaction_ids,
     )
 
 
@@ -562,14 +777,11 @@ def open_reader(path: Path) -> BinaryIO:
         raise WalIOError(f"no se pudo abrir el WAL para lectura en {path}: {exc}") from exc
 
 
-def dump_records(path: Path) -> list[LogRecord]:
+def dump_records(path: Path, fs: FileSystem | None = None) -> list[LogRecord]:
     """Lee todos los registros legibles de `path`, ignorando una posible
     cola truncada (uso pensado para inspección/depuración, p.ej. desde la CLI)."""
     records: list[LogRecord] = []
-    buffer = io.BytesIO()
-    with open(path, "rb") as reader:
-        buffer.write(reader.read())
-    buffer.seek(0)
+    buffer = io.BytesIO((fs or OsFileSystem()).read_bytes(path))
     try:
         for record in iter_records(buffer):
             records.append(record)
