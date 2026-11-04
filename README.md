@@ -62,7 +62,7 @@ All integers are encoded big-endian:
 
 The `payload` encodes, with an explicit length per field: the table (`str`), the key (`bytes`), the "after" value (`new_value`, optional), the "before" value (`old_value`, optional), and — only in checkpoint records — the list of active transaction ids. The CRC32 checksum covers the full header + payload, so any corrupted bit in any field is detected.
 
-Record types (`RecordType`): `INSERT`, `UPDATE`, `DELETE`, `COMMIT`, `ABORT`, `CHECKPOINT_BEGIN`, `CHECKPOINT_END`.
+Record types (`RecordType`): `INSERT`, `UPDATE`, `DELETE`, `COMMIT`, `ABORT` (legacy), `CHECKPOINT_BEGIN`, `CHECKPOINT_END`, `ROLLBACK`.
 
 ### Durable writes
 
@@ -72,9 +72,65 @@ Every call to `append_insert` / `append_update` / `append_delete` / `commit` / `
 
 1. **Analysis:** the full log is scanned, noting which transactions ended up with a `COMMIT` record.
 2. **Redo:** **all** operations in the history are reapplied in LSN order — not just those from committed transactions. This rebuilds the exact state storage had right before the crash (which already reflected writes from transactions that were not yet committed), a necessary condition for each operation's `old_value` to be valid in the next step. Limiting redo to committed transactions breaks reconstruction whenever an uncommitted transaction and a later committed one touch the same key.
-3. **Undo:** transactions without a `COMMIT` (explicitly aborted, or interrupted by the crash) are rolled back in reverse LSN order using each of their operations' `old_value`, on top of the state already reconstructed in the previous step.
+3. **Undo:** transactions without a final record (`COMMIT` or `ROLLBACK`) — interrupted by the crash, or aborted by a legacy `ABORT` — are rolled back in reverse LSN order using each of their operations' `old_value`, on top of the state already reconstructed in the previous step. Transactions closed by `ROLLBACK` need no undo: their compensation records were replayed by the redo (see below).
 
 A truncated tail (`TruncatedRecordError`, a half-written record) or real corruption (`ChecksumMismatchError` / `InvalidRecordError`) stop reading at that exact point; everything before it — already confirmed with `fsync` — is still recovered. The process never crashes because of this: the issue is reflected in the `RecoveryReport`'s `stopped_due_to_truncation` / `stopped_due_to_corruption` flags.
+
+### Rollback with compensation records (CLRs)
+
+Redo repeats the whole history, so the undo of a transaction must be part
+of that history too. `abort(txn)` writes one **compensation record** per
+operation of the transaction — its exact inverse, newest first — and a
+final `ROLLBACK` record; the caller still undoes the effect in its storage
+as before. Recovery replays those CLRs in LSN order during redo and only
+undoes transactions with **no** final record (`COMMIT` or `ROLLBACK`).
+Recovery itself does the same for the transactions a crash interrupted:
+after undoing them in the storage it appends their CLRs and a `ROLLBACK`
+to the log. Logs written by older versions, whose `ABORT` record carried
+no compensation, keep their old meaning (undone during recovery).
+
+Without this, an aborted (or crash-interrupted) transaction was undone at
+*every* recovery, after redo — on top of any later committed transaction
+that wrote the same key, silently reverting a committed value.
+
+### Torn tails and log repair
+
+`recover()` stops reading at the first record that is truncated or fails
+its CRC: nothing after it is trusted. It then repairs the log so that it
+matches what it just did: the unreadable tail is saved to
+`<wal>.tail-<offset>` and cut off, and the interrupted transactions are
+closed with CLRs (`recover(..., repair=False)` keeps the file untouched).
+`WriteAheadLog` performs the same tail cut when it is opened directly.
+Before, reopening the log after a torn write either failed (`ChecksumMismatchError`)
+or appended new records *behind* the garbage, where no recovery would ever
+reach them — committed transactions lost on the next crash.
+
+### Pluggable file layer and fault injection
+
+All file I/O goes through a `FileSystem` (`faultfs.py`): `OsFileSystem` in
+production, and `FaultyFileSystem`, a disk model with injectable faults
+used by the crash tests (after Pillai et al., *All File Systems Are Not
+Created Equal*, OSDI 2014):
+
+* a volatile page cache — writes are pending until `fsync`;
+* **torn writes at sector granularity** — a pending write is split into
+  512-byte sectors and, at the crash, each sector independently persists
+  or not (sectors themselves are atomic);
+* **reordering of unsynchronised writes** — a later sector may persist
+  while an earlier one is lost (holes read back as zeros);
+* a **lying `fsync`** — with a given probability it reports success
+  without making anything durable;
+* directory metadata — creating, renaming or deleting a file is durable
+  only after `fsync` of the directory; at the crash a prefix of the
+  unsynchronised namespace operations survives.
+
+`FaultyFileSystem(crash_at=k)` raises `SimulatedCrash` right before its
+k-th mutating operation, `pending_units()` lists every independent
+persist-or-lose decision and `crash_image(keep)` builds the disk a restart
+would see. The WAL now also `fsync`s the directory after creating the log
+file and after the compaction rename: without it, a crash could make a
+freshly created log — or the compacted one, which receives every later
+append — vanish together with committed transactions.
 
 ### Checkpointing and safe truncation
 
@@ -87,6 +143,7 @@ src/write_ahead_log_recovery/
 ├── __init__.py     # re-exported public API
 ├── models.py       # RecordType, LogRecord, CheckpointInfo, RecoveryReport, exceptions
 ├── protocols.py     # StorageApplier: the contract storage engines implement
+├── faultfs.py       # FileSystem layer: OsFileSystem + FaultyFileSystem (fault injection)
 ├── pipeline.py       # binary (de)serialization, WriteAheadLog, recover()
 └── __main__.py       # demonstration CLI
 ```
@@ -170,7 +227,35 @@ ruff format --check .
 mypy --strict src/
 ```
 
-The test suite covers: binary serialization round-trips for all 7 record types, truncation detection at different cut points, checksum corruption detection without interrupting the process, basic redo/undo, checkpoint + safe truncation, and property-based tests with fixed-seed random workloads that compare the recovered state against a reference oracle.
+**Crash consistency** (`tests/test_crash_consistency.py`, `tests/crashsim.py`):
+a deterministic workload — interleaved transactions over disjoint keys,
+aborts, and checkpoints that persist a storage file atomically before
+truncating the log, like a real engine — runs on a `FaultyFileSystem` that
+crashes right before its k-th I/O operation (every write, `fsync`, create,
+rename and directory `fsync`). The invariant after recovery: the state is
+**exactly** that of a prefix of the commit history (nothing half-applied,
+no holes, no effect of aborted transactions) and, with an honest `fsync`,
+the prefix contains every transaction whose `commit()` returned.
+
+* exhaustive on small workloads: every crash point × every subset of the
+  pending sectors/truncations/namespace operations (183 crash points and
+  404 disk images over three seeds);
+* restart: crash, recover, reopen, keep committing, crash again — both
+  sessions' acknowledged commits must survive (every crash point of two
+  seeds);
+* random on large workloads: 120 runs of 60 transactions with random crash
+  points and random persistence of pending sectors; and 120 more with a
+  `fsync` that lies 40% of the time, where only atomicity can be demanded
+  (the log alone, without checkpoints).
+
+They found four real bugs, each kept as a plain-file regression in
+`tests/test_regressions.py` (all four fail on the previous release): the
+missing directory `fsync` after creating the log and after compaction,
+appending behind an unreadable tail (and failing to reopen a log whose
+last record had a bad CRC), and undoing aborted/interrupted transactions
+on top of later commits (fixed with compensation records).
+
+The rest of the suite covers: binary serialization round-trips for all record types, truncation detection at different cut points, checksum corruption detection without interrupting the process, basic redo/undo, checkpoint + safe truncation, and property-based tests with fixed-seed random workloads that compare the recovered state against a reference oracle.
 
 ## Benchmarks
 
